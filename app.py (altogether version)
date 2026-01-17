@@ -1,0 +1,520 @@
+import subprocess
+import os
+import pandas as pd
+from pathlib import Path
+from pyngrok import ngrok
+import requests
+from bs4 import BeautifulSoup
+import re
+from datetime import datetime, timezone
+import time
+import json
+from urllib.parse import urljoin # Added import for urljoin
+import streamlit as st
+from transformers import pipeline
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud, STOPWORDS
+
+
+# --- Step 0: Install all necessary libraries ---
+print("Installing/upgrading necessary libraries...")
+!pip install -q streamlit pyngrok transformers wordcloud matplotlib pandas requests beautifulsoup4 lxml torch
+
+# Ensure the 'data' directory exists
+data_dir_path = Path("data")
+data_dir_path.mkdir(parents=True, exist_ok=True)
+print(f"Ensured '{data_dir_path}' directory exists.")
+
+# --- Step 1: Initial Data Scraping (products, testimonials, reviews) ---
+print("\n--- Performing initial data scraping... ---")
+BASE_URL = "https://web-scraping.dev" # Updated BASE_URL
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+def clean_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+def try_parse_date(s: str) -> str:
+    s = clean_text(s)
+    if not s:
+        return ""
+    dt = pd.to_datetime(s, errors="coerce")
+    if pd.isna(dt):
+        return ""
+    return dt.date().isoformat()
+
+def get_session() -> requests.Session:
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": USER_AGENT})
+    return sess
+
+def scrape_products_data(sess: requests.Session, max_pages: int = 50, sleep_s: float = 0.2) -> pd.DataFrame:
+    rows = []
+    seen = set()
+    for page in range(1, max_pages + 1):
+        r = sess.get(f"{BASE_URL}/products", params={"page": page} if page > 1 else None, timeout=30)
+        if r.status_code != 200:
+            print(f"Failed to fetch products page {page}. Status code: {r.status_code}")
+            break
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        # Debugging: Print relevant HTML to inspect product links
+        # print(f"\n--- HTML for products page {page} ---")
+        # print(soup.prettify())
+        # print("---\n")
+
+        urls = []
+        for a in soup.select("a[href]"):
+            href = a.get("href") or ""
+            if re.search(r"/product/\d+\b", href): # Fixed regex escaping
+                urls.append(urljoin(BASE_URL, href))
+        
+        if not urls:
+            print(f"No new product URLs found on page {page}. Current collected: {len(seen)}")
+            if page == 1: # If no URLs on the first page, something is wrong
+                print("Could not find any product URLs. Check HTML selectors/regex.")
+            break
+
+        new_urls = [u for u in urls if u not in seen]
+        if not new_urls:
+            break
+        for u in new_urls:
+            seen.add(u)
+            rows.append({"url": u, "page": page})
+
+        time.sleep(sleep_s)
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=["url"]).reset_index(drop=True)
+    if df.empty:
+        print("No products found after URL collection.")
+        return df
+    titles, prices = [], []
+    for u in df["url"].tolist():
+        info = parse_product_detail(sess, u)
+        titles.append(info["title"])
+        prices.append(info["price"])
+        time.sleep(0.05)
+    df["title"] = titles
+    df["price"] = prices
+    return df[["title", "url", "price", "page"]]
+
+def parse_product_detail(sess: requests.Session, url: str) -> dict:
+    r = sess.get(url, timeout=30)
+    if r.status_code != 200:
+        return {"title": "", "price": None}
+    soup = BeautifulSoup(r.text, "html.parser")
+    title_el = soup.select_one(".product-title")
+    title = clean_text(title_el.get_text()) if title_el else ""
+    price_el = soup.select_one(".product-price")
+    price = None
+    if price_el:
+        m = re.search(r"(\d+(?:\.\d+)?)", price_el.get_text()) # Fixed regex escaping
+        if m:
+            price = float(m.group(1))
+    return {"title": title, "price": price}
+
+def scrape_testimonials_data(sess: requests.Session, max_pages: int = 200) -> pd.DataFrame:
+    rows = []
+    api_url = f"{BASE_URL}/api/testimonials"
+    headers = {
+        "X-Secret-Token": "secret123",
+        "Referer": f"{BASE_URL}/testimonials",
+        "User-Agent": USER_AGENT,
+    }
+    for page in range(1, max_pages + 1):
+        r = sess.get(api_url, headers=headers, params={"page": page})
+        if r.status_code != 200:
+            break
+        soup = BeautifulSoup(r.text, "html.parser")
+        cards = soup.select(".testimonial")
+        if not cards:
+            break
+        for c in cards:
+            text = clean_text(c.get_text(" "))
+            rating = len(c.select(".rating svg"))
+            rows.append(
+                {
+                    "text": text,
+                    "rating": rating if rating > 0 else None,
+                    "page": page,
+                }
+            )
+        time.sleep(0.2)
+    return pd.DataFrame(rows).drop_duplicates()
+
+def get_csrf_from_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    inp = soup.select_one('input[name="csrf-token"]')
+    return inp.get("value") if inp else ""
+
+def get_embedded_reviews(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    tag = soup.select_one("script#reviews-data")
+    if not tag:
+        return []
+    try:
+        return json.loads(tag.get_text())
+    except Exception:
+        return []
+
+def scrape_reviews_data(sess: requests.Session, products_df: pd.DataFrame, max_pages: int = 50) -> pd.DataFrame:
+    rows = []
+    product_ids = (
+        products_df["url"]
+        .astype(str)
+        .str.extract(r"/product/(\d+)", expand=False) # Fixed regex escaping
+        .dropna()
+        .astype(int)
+        .unique()
+        .tolist()
+    )
+    for pid in product_ids:
+        product_url = f"{BASE_URL}/product/{pid}"
+        r = sess.get(product_url)
+        if r.status_code != 200:
+            continue
+        csrf = get_csrf_from_html(r.text)
+        embedded = get_embedded_reviews(r.text)
+        for it in embedded:
+            rows.append(
+                {
+                    "product_id": pid,
+                    "id": it.get("id"),
+                    "date": try_parse_date(it.get("date", "")),
+                    "rating": it.get("rating"),
+                    "text": clean_text(it.get("text", "")),
+                    "page": 1,
+                }
+            )
+        if not csrf:
+            continue
+        headers = {
+            "x-csrf-token": csrf,
+            "Referer": product_url,
+            "User-Agent": USER_AGENT,
+        }
+        api_url = f"{BASE_URL}/api/reviews"
+        page = 2
+        while page <= max_pages:
+            rr = sess.get(api_url, headers=headers, params={"product_id": pid, "page": page})
+            if rr.status_code != 200:
+                break
+            data = rr.json()
+            results = data.get("results", [])
+            if not results:
+                break
+            for it in results:
+                rows.append(
+                    {
+                        "product_id": pid,
+                        "id": it.get("id"),
+                        "date": try_parse_date(it.get("date", "")),
+                        "rating": it.get("rating"),
+                        "text": clean_text(it.get("text", "")),
+                        "page": page,
+                    }
+            )
+            if not data.get("next_url"):
+                break
+            page += 1
+            time.sleep(0.2)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["id"] = df["id"].fillna("").astype(str)
+    df["text"] = df["text"].fillna("").astype(str).str.strip()
+    df["date"] = df["date"].fillna("").astype(str)
+    df["_key"] = df.apply(
+        lambda r: f"{r['product_id']}|ID|{r['id']}" if r["id"] else f"{r['product_id']}|DTXT|{r['date']}|{r['text']}",
+        axis=1,
+    )
+    df = df.drop_duplicates(subset=["_key"]).drop(columns=["_key"])
+    return df
+
+sess = get_session()
+
+products = scrape_products_data(sess)
+products.to_csv(data_dir_path / "products.csv", index=False)
+print(f"Saved {len(products)} rows to products.csv")
+
+testimonials = scrape_testimonials_data(sess)
+testimonials.to_csv(data_dir_path / "testimonials.csv", index=False)
+print(f"Saved {len(testimonials)} rows to testimonials.csv")
+
+reviews = scrape_reviews_data(sess, products)
+reviews.to_csv(data_dir_path / "reviews.csv", index=False)
+print(f"Saved {len(reviews)} rows to reviews.csv")
+
+
+# --- Step 2: Perform Sentiment Analysis ---
+print("\n--- Performing sentiment analysis on reviews... ---")
+
+reviews_path = data_dir_path / "reviews.csv"
+out_path = data_dir_path / "reviews_with_sentiment.csv"
+
+if not reviews_path.exists():
+    print("No reviews.csv found. Skipping sentiment analysis.")
+else:
+    df = pd.read_csv(reviews_path)
+    if df.empty or "text" not in df.columns:
+        print("reviews.csv empty or missing 'text' column. Skipping sentiment analysis.")
+    else:
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"])
+            df = df[df["date"].dt.year == 2023].copy()
+
+        df["text"] = df["text"].astype(str).fillna("").astype(str)
+        texts = df["text"].tolist()
+
+        has_rating = "rating" in df.columns
+        ratings = df["rating"].tolist() if has_rating else [None] * len(df)
+
+        clf = pipeline(
+            "sentiment-analysis",
+            model="distilbert-base-uncased-finetuned-sst-2-english",
+            device=-1, # -1 for CPU, 0 for GPU
+        )
+
+        def fallback_from_rating(r):
+            if r is None or (isinstance(r, float) and pd.isna(r)):
+                return None
+            try:
+                r = float(r)
+            except Exception:
+                return None
+            if r >= 4:
+                return ("Positive", 0.99)
+            if r <= 2:
+                return ("Negative", 0.99)
+            return None
+
+        batch_size = 8
+        sentiments = [None] * len(texts)
+        confidences = [None] * len(texts)
+
+        i = 0
+        while i < len(texts):
+            batch_idx = []
+            batch_txt = []
+            for j in range(i, min(i + batch_size, len(texts))):
+                t = (texts[j] or "").strip()
+                word_count = len(t.split())
+                if word_count < 3:
+                    fb = fallback_from_rating(ratings[j])
+                    if fb is not None:
+                        lab, sc = fb
+                        sentiments[j] = lab
+                        confidences[j] = sc
+                        continue
+                batch_idx.append(j)
+                batch_txt.append(t[:5000])
+
+            if batch_txt:
+                outs = clf(batch_txt, truncation=True, max_length=128)
+                for k, j in enumerate(batch_idx):
+                    o = outs[k]
+                    label = str(o.get("label", "")).upper()
+                    score = float(o.get("score", 0.0))
+                    label_norm = "Positive" if label.startswith("POS") else "Negative"
+                    sentiments[j] = label_norm
+                    confidences[j] = score
+            i += batch_size
+
+        df["sentiment"] = sentiments
+        df["confidence"] = confidences
+        df.to_csv(out_path, index=False)
+        print(f"Saved: {out_path} ({len(df)} rows)")
+
+
+# --- Step 3: Save the Streamlit application code to `app.py` ---
+print("\n--- Saving Streamlit app code to app.py ---")
+streamlit_app_code = '''
+import streamlit as st
+import pandas as pd
+from transformers import pipeline
+import matplotlib.pyplot as plt
+from pathlib import Path
+from wordcloud import WordCloud, STOPWORDS
+
+st.set_page_config(page_title="Brand Reputation Monitor \u2013 2023", layout="wide")
+
+APP_DIR = Path(".")
+DATA_DIR = APP_DIR / "data"
+
+@st.cache_data
+def load_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+products_df = load_csv(DATA_DIR / "products.csv")
+testimonials_df = load_csv(DATA_DIR / "testimonials.csv")
+reviews_df = load_csv(DATA_DIR / "reviews_with_sentiment.csv")
+
+st.sidebar.title("Navigation")
+section = st.sidebar.radio(
+    "Select Section",
+    ["Products", "Testimonials", "Reviews"]
+)
+
+if section == "Products":
+    st.title("Products")
+
+    if products_df.empty:
+        st.warning("No product data available. Run the scraping script first.")
+    else:
+        st.dataframe(
+            products_df,
+            use_container_width=True
+        )
+
+elif section == "Testimonials":
+    st.title("Testimonials")
+
+    if testimonials_df.empty:
+        st.warning("No testimonial data available. Run the scraping script first.")
+    else:
+        st.dataframe(
+            testimonials_df,
+            use_container_width=True
+        )
+
+else:
+    st.title("Customer Reviews \u2013 Sentiment Analysis (2023)")
+
+    if reviews_df.empty:
+        st.error(
+            "No reviews_with_sentiment.csv found. "
+            "Run the scraping and sentiment scripts first."
+        )
+        st.stop()
+
+    reviews_df["date"] = pd.to_datetime(
+        reviews_df["date"],
+        errors="coerce"
+    )
+    reviews_df = reviews_df.dropna(subset=["date"])
+
+    reviews_df = reviews_df[
+        reviews_df["date"].dt.year == 2023
+    ].copy()
+
+    # --------------------------------------------------
+    # Month Selection
+    # --------------------------------------------------
+
+    months = pd.period_range(
+        "2023-01",
+        "2023-12",
+        freq="M"
+    )
+
+    selected_month = st.select_slider(
+        "Select Month (2023)",
+        options=months,
+        format_func=lambda p: p.strftime("%B %Y")
+    )
+
+    filtered = reviews_df[
+        (reviews_df["date"].dt.month == selected_month.month)
+    ]
+
+    if filtered.empty:
+        st.warning("No reviews found for the selected month.")
+        st.stop()
+
+    # --------------------------------------------------
+    # Display Filtered Reviews
+    # --------------------------------------------------
+
+    st.subheader("Filtered Reviews")
+
+    st.dataframe(
+        filtered[
+            ["date", "text", "rating", "sentiment", "confidence"]
+        ],
+        use_container_width=True
+    )
+
+    # --------------------------------------------------
+    # Visualization
+    # --------------------------------------------------
+
+    st.subheader("Sentiment Distribution")
+
+    sentiment_counts = filtered["sentiment"].value_counts()
+    avg_confidence = filtered.groupby("sentiment")["confidence"].mean()
+
+    fig, ax = plt.subplots()
+
+    sentiment_counts.plot(
+        kind="bar",
+        ax=ax
+    )
+
+    ax.set_xlabel("Sentiment")
+    ax.set_ylabel("Number of Reviews")
+    ax.set_title("Positive vs Negative Reviews")
+
+    for idx, label in enumerate(sentiment_counts.index):
+        ax.text(
+            idx,
+            sentiment_counts[label],
+            f"Avg confidence: {avg_confidence[label]:.2f}",
+            ha="center",
+            va="bottom"
+        )
+
+    st.pyplot(fig)
+
+    st.write("### Word Cloud (selected month)")
+    text_blob = " ".join(filtered["text"].astype(str).tolist()).strip()
+
+    if not text_blob:
+        st.info("No text available for word cloud.")
+    else:
+        wc = WordCloud(
+            width=800,
+            height=400,
+            background_color="white",
+            stopwords=set(STOPWORDS),
+        ).generate(text_blob)
+
+        fig, ax = plt.subplots()
+        ax.imshow(wc, interpolation="bilinear")
+        ax.axis("off")
+        st.pyplot(fig, use_container_width=True)
+'''
+with open('app.py', 'w') as f:
+    f.write(streamlit_app_code)
+print("Streamlit app code saved to app.py")
+
+# 4. Set ngrok authtoken
+#    IMPORTANT: Replace "<YOUR_AUTH_TOKEN>" with your actual ngrok authtoken!
+#    You can find your authtoken here: https://dashboard.ngrok.com/get-started/your-authtoken
+ngrok_auth_token = "38Mi537zwGUbhedqA8inxnHJD9F_2KeZDd5WR8dACcnUwxNUS" # Using the token from the previous successful set_auth_token
+
+ngrok.set_auth_token(ngrok_auth_token)
+print("\nngrok autotoken has been set. (Using the token: 38Mi537zwGUbhedqA8inxnHJD9F_2KeZDd5WR8dACcnUwxNUS)")
+
+
+# --- Step 5: Start ngrok tunnel and launch Streamlit app in background ---
+print("\nStarting ngrok tunnel and Streamlit app...")
+
+try:
+    public_url = ngrok.connect('8501')
+    print(f"Streamlit App URL: {public_url}")
+
+    # Run Streamlit app in the background using nohup and shell=True for full detachment and redirection
+    # This ensures the Streamlit app continues running even if the current Colab cell finishes.
+    streamlit_command = f"nohup streamlit run app.py --server.port 8501 --server.headless true > streamlit_app.log 2>&1 &"
+    subprocess.Popen(streamlit_command, shell=True)
+    print("Streamlit app launched in the background. Check 'streamlit_app.log' for output.")
+
+except Exception as e:
+    print(f"❌ Error starting ngrok or Streamlit: {e}")
+    print("Please ensure your ngrok autotoken is correct and try again.")

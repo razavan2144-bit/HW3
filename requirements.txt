@@ -1,0 +1,10 @@
+*   `streamlit`
+*   `pandas`
+*   `pyngrok`
+*   `transformers`
+*   `wordcloud`
+*   `matplotlib`
+*   `requests`
+*   `beautifulsoup4`
+*   `lxml` (often is a dependent of BeautifulSoup4)
+*   `torch` (needed for `transformers`)
